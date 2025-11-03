@@ -299,10 +299,28 @@ async def log_join_session(username: str, join_time: datetime.datetime, channel_
         # Get next row number before appending
         row_number = await asyncio.to_thread(get_next_row_number, worksheet)
 
-        # Write initial row: [날짜, 시작 시각, "작업 중···", ""]
-        row = [date_str, join_str, "작업 중···", ""]
+        # Create formula to calculate duration (will show "작업 중···" when C column is empty)
+        duration_formula = f'=IF(OR(B{row_number}="", C{row_number}=""), IF(B{row_number}="", "", "작업 중···"), LET(start, TIMEVALUE(B{row_number}), end, TIMEVALUE(C{row_number}), diff, end - start, hours, INT(diff * 24), minutes, ROUND(MOD(diff * 24, 1) * 60, 0), hours & "H " & TEXT(minutes, "00") & "M"))'
 
-        success = await append_to_sheet_with_retry(worksheet, row)
+        # Write initial row: [날짜, 시작 시각, "", duration_formula]
+        row = [date_str, join_str, "", duration_formula]
+
+        # Append row with formula using retry logic
+        success = False
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                await asyncio.to_thread(worksheet.append_row, row, value_input_option='USER_ENTERED')
+                success = True
+                break
+            except APIError as e:
+                print(f"⚠️ APIError on attempt {attempt+1}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(5)
+            except Exception as e:
+                print(f"⚠️ Error on attempt {attempt+1}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(5)
         if success:
             print(f"✅ Logged JOIN for {username} at {join_str} in {channel_name} (row {row_number})")
             return row_number
@@ -314,28 +332,99 @@ async def log_join_session(username: str, join_time: datetime.datetime, channel_
         traceback.print_exc()
         return None
 
-async def update_leave_session(username: str, leave_time: datetime.datetime, duration: datetime.timedelta, row_number: int):
+async def update_leave_session(username: str, join_time: datetime.datetime, leave_time: datetime.datetime, duration: datetime.timedelta, row_number: int):
     """
-    Update the existing row with leave time and duration.
+    Update the existing row with leave time and add formula for duration calculation.
+    If the session spans multiple days, split it into separate rows.
 
     Args:
         username: User's display name
+        join_time: When the user joined
         leave_time: When the user left
-        duration: Session duration
+        duration: Session duration (kept for logging purposes)
         row_number: Row number to update
     """
     try:
         worksheet = await asyncio.to_thread(get_or_create_worksheet, username)
 
-        leave_str = leave_time.strftime("%H:%M")
         duration_str = format_duration(duration)
 
-        # Update columns C and D (leave time and duration)
-        def update_row():
-            worksheet.update(values=[[leave_str, duration_str]], range_name=f"C{row_number}:D{row_number}")
+        # Check if the session spans multiple days
+        join_date = join_time.date()
+        leave_date = leave_time.date()
 
-        await asyncio.to_thread(update_row)
-        print(f"✅ Updated LEAVE for {username}: {leave_str} ({duration_str}) at row {row_number}")
+        if join_date == leave_date:
+            # Same day - simple update
+            leave_str = leave_time.strftime("%H:%M")
+            duration_formula = f'=IF(OR(B{row_number}="", C{row_number}=""), IF(B{row_number}="", "", "작업 중···"), LET(start, TIMEVALUE(B{row_number}), end, TIMEVALUE(C{row_number}), diff, end - start, hours, INT(diff * 24), minutes, ROUND(MOD(diff * 24, 1) * 60, 0), hours & "H " & TEXT(minutes, "00") & "M"))'
+
+            def update_row():
+                worksheet.update(values=[[leave_str, duration_formula]], range_name=f"C{row_number}:D{row_number}", value_input_option='USER_ENTERED')
+
+            await asyncio.to_thread(update_row)
+            print(f"✅ Updated LEAVE for {username}: {leave_str} ({duration_str}) at row {row_number}")
+        else:
+            # Multiple days - split into separate rows
+            current_date = join_time
+            rows_to_add = []
+
+            # First row: join_time ~ 23:59 (update existing row)
+            end_of_first_day = current_date.replace(hour=23, minute=59, second=59)
+            duration_formula = f'=IF(OR(B{row_number}="", C{row_number}=""), IF(B{row_number}="", "", "작업 중···"), LET(start, TIMEVALUE(B{row_number}), end, TIMEVALUE(C{row_number}), diff, end - start, hours, INT(diff * 24), minutes, ROUND(MOD(diff * 24, 1) * 60, 0), hours & "H " & TEXT(minutes, "00") & "M"))'
+
+            def update_first_row():
+                worksheet.update(values=[["23:59", duration_formula]], range_name=f"C{row_number}:D{row_number}", value_input_option='USER_ENTERED')
+
+            await asyncio.to_thread(update_first_row)
+            print(f"✅ Updated first day for {username}: {join_time.strftime('%m/%d %H:%M')} ~ 23:59")
+
+            # Move to next day
+            current_date = current_date.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=1)
+
+            # Middle days and last day
+            while current_date.date() <= leave_date:
+                date_str = current_date.strftime("%m/%d")
+                start_str = "00:00"
+
+                if current_date.date() == leave_date:
+                    # Last day: 00:00 ~ leave_time
+                    end_str = leave_time.strftime("%H:%M")
+                else:
+                    # Middle day: 00:00 ~ 23:59
+                    end_str = "23:59"
+
+                # Get the next row number for formula
+                next_row = await asyncio.to_thread(get_next_row_number, worksheet)
+                duration_formula = f'=IF(OR(B{next_row}="", C{next_row}=""), IF(B{next_row}="", "", "작업 중···"), LET(start, TIMEVALUE(B{next_row}), end, TIMEVALUE(C{next_row}), diff, end - start, hours, INT(diff * 24), minutes, ROUND(MOD(diff * 24, 1) * 60, 0), hours & "H " & TEXT(minutes, "00") & "M"))'
+
+                row = [date_str, start_str, end_str, duration_formula]
+
+                # Append the row
+                max_retries = 3
+                success = False
+                for attempt in range(max_retries):
+                    try:
+                        await asyncio.to_thread(worksheet.append_row, row, value_input_option='USER_ENTERED')
+                        success = True
+                        break
+                    except APIError as e:
+                        print(f"⚠️ APIError on attempt {attempt+1}: {e}")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(5)
+                    except Exception as e:
+                        print(f"⚠️ Error on attempt {attempt+1}: {e}")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(5)
+
+                if success:
+                    print(f"✅ Added continuation for {username}: {date_str} {start_str} ~ {end_str}")
+                else:
+                    print(f"❌ Failed to add continuation row for {username}")
+
+                current_date += datetime.timedelta(days=1)
+
+            print(f"✅ Split multi-day session for {username} ({duration_str} total)")
+
         return True
     except Exception as e:
         print(f"❌ Error updating LEAVE for {username}: {e}")
@@ -440,7 +529,7 @@ async def on_voice_state_update(member, before, after):
             if row_number:
                 if total_minutes >= MIN_SESSION_MINUTES:
                     # Update the row with leave time and duration
-                    await update_leave_session(username, now, duration, row_number)
+                    await update_leave_session(username, session["join_time"], now, duration, row_number)
                 else:
                     # Delete the row for short sessions
                     await delete_session_row(username, row_number, total_minutes)
@@ -462,7 +551,7 @@ async def on_voice_state_update(member, before, after):
 
             if row_number:
                 if total_minutes >= MIN_SESSION_MINUTES:
-                    await update_leave_session(username, now, duration, row_number)
+                    await update_leave_session(username, session["join_time"], now, duration, row_number)
                 else:
                     await delete_session_row(username, row_number, total_minutes)
 
