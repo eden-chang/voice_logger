@@ -1,0 +1,23 @@
+# Secrets
+.env
+.env.*
+!.env.example
+credentials*.json
+*.pem
+*.key
+
+# Runtime state
+active_sessions.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor / tooling
+.claude/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
