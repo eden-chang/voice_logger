@@ -236,7 +236,7 @@ def get_or_create_worksheet(username: str):
         raise
     return worksheet
 
-async def append_to_sheet_with_retry(worksheet, values, max_retries=3, delay=5):
+async def append_to_sheet_with_retry(worksheet, values, max_retries=3, delay=5, value_input_option='USER_ENTERED'):
     """
     Append a row to a worksheet with retry logic (async-safe).
 
@@ -245,6 +245,7 @@ async def append_to_sheet_with_retry(worksheet, values, max_retries=3, delay=5):
         values: List of values to append as a row
         max_retries: Maximum number of retry attempts
         delay: Delay in seconds between retries
+        value_input_option: 'USER_ENTERED' so formulas are evaluated
 
     Returns:
         True if successful, False otherwise
@@ -252,7 +253,7 @@ async def append_to_sheet_with_retry(worksheet, values, max_retries=3, delay=5):
     for attempt in range(max_retries):
         try:
             # Run blocking gspread call in thread pool to avoid blocking event loop
-            await asyncio.to_thread(worksheet.append_row, values)
+            await asyncio.to_thread(worksheet.append_row, values, value_input_option=value_input_option)
             return True
         except APIError as e:
             print(f"⚠️ APIError on attempt {attempt+1}: {e}")
@@ -305,22 +306,7 @@ async def log_join_session(username: str, join_time: datetime.datetime, channel_
         # Write initial row: [날짜, 시작 시각, "", duration_formula]
         row = [date_str, join_str, "", duration_formula]
 
-        # Append row with formula using retry logic
-        success = False
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                await asyncio.to_thread(worksheet.append_row, row, value_input_option='USER_ENTERED')
-                success = True
-                break
-            except APIError as e:
-                print(f"⚠️ APIError on attempt {attempt+1}: {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(5)
-            except Exception as e:
-                print(f"⚠️ Error on attempt {attempt+1}: {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(5)
+        success = await append_to_sheet_with_retry(worksheet, row)
         if success:
             print(f"✅ Logged JOIN for {username} at {join_str} in {channel_name} (row {row_number})")
             return row_number
@@ -366,10 +352,8 @@ async def update_leave_session(username: str, join_time: datetime.datetime, leav
         else:
             # Multiple days - split into separate rows
             current_date = join_time
-            rows_to_add = []
 
             # First row: join_time ~ 23:59 (update existing row)
-            end_of_first_day = current_date.replace(hour=23, minute=59, second=59)
             duration_formula = f'=IF(OR(B{row_number}="", C{row_number}=""), IF(B{row_number}="", "", "작업 중···"), LET(start, TIMEVALUE(B{row_number}), end, TIMEVALUE(C{row_number}), diff, end - start, hours, INT(diff * 24), minutes, ROUND(MOD(diff * 24, 1) * 60, 0), hours & "H " & TEXT(minutes, "00") & "M"))'
 
             def update_first_row():
@@ -399,22 +383,7 @@ async def update_leave_session(username: str, join_time: datetime.datetime, leav
 
                 row = [date_str, start_str, end_str, duration_formula]
 
-                # Append the row
-                max_retries = 3
-                success = False
-                for attempt in range(max_retries):
-                    try:
-                        await asyncio.to_thread(worksheet.append_row, row, value_input_option='USER_ENTERED')
-                        success = True
-                        break
-                    except APIError as e:
-                        print(f"⚠️ APIError on attempt {attempt+1}: {e}")
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(5)
-                    except Exception as e:
-                        print(f"⚠️ Error on attempt {attempt+1}: {e}")
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(5)
+                success = await append_to_sheet_with_retry(worksheet, row)
 
                 if success:
                     print(f"✅ Added continuation for {username}: {date_str} {start_str} ~ {end_str}")
